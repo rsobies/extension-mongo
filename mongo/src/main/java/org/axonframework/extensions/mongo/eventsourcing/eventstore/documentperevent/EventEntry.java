@@ -19,6 +19,7 @@ package org.axonframework.extensions.mongo.eventsourcing.eventstore.documentpere
 import com.mongodb.DBObject;
 import org.axonframework.eventhandling.DomainEventData;
 import org.axonframework.eventhandling.DomainEventMessage;
+import org.axonframework.extensions.mongo.MongoTimestamps;
 import org.axonframework.serialization.SerializedMetaData;
 import org.axonframework.serialization.SerializedObject;
 import org.axonframework.serialization.Serializer;
@@ -26,10 +27,8 @@ import org.axonframework.serialization.SimpleSerializedObject;
 import org.bson.Document;
 
 import java.time.Instant;
-import java.util.Date;
 import java.util.Objects;
 
-import static org.axonframework.common.DateTimeUtils.parseInstant;
 
 /**
  * Implementation of a serialized event message that can be used to create a Mongo document.
@@ -87,15 +86,7 @@ public class EventEntry implements DomainEventData<Object> {
         aggregateType = (String) dbObject.get(configuration.typeProperty());
         sequenceNumber = ((Number) dbObject.get(configuration.sequenceNumberProperty())).longValue();
         serializedPayload = dbObject.get(configuration.payloadProperty());
-        Object timestampField = dbObject.get(configuration.timestampProperty());
-        if(timestampField instanceof Date) {
-            timestamp = ((Date) timestampField).toInstant();
-        }
-        else if(timestampField instanceof Instant) {
-            timestamp = (Instant) timestampField;
-        }
-        else timestamp = parseInstant((String)timestampField);//to ensure backward compatibility
-        // when timestamps were written as strings
+        timestamp = MongoTimestamps.toInstant(dbObject.get(configuration.timestampProperty()));
 
         payloadType = (String) dbObject.get(configuration.payloadTypeProperty());
         payloadRevision = (String) dbObject.get(configuration.payloadRevisionProperty());

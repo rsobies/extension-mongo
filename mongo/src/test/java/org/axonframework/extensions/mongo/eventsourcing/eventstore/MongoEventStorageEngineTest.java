@@ -24,6 +24,7 @@ import org.axonframework.eventhandling.TrackingToken;
 import org.axonframework.extensions.mongo.MongoTemplate;
 import org.axonframework.extensions.mongo.util.MongoTemplateFactory;
 import org.axonframework.extensions.mongo.utils.TestSerializer;
+import org.bson.Document;
 import org.junit.jupiter.api.*;
 import org.testcontainers.containers.MongoDBContainer;
 import org.testcontainers.junit.jupiter.Container;
@@ -36,6 +37,7 @@ import java.util.Optional;
 import java.util.function.UnaryOperator;
 
 import static java.util.stream.Collectors.toList;
+import static org.axonframework.common.DateTimeUtils.formatInstant;
 import static org.axonframework.eventsourcing.utils.EventStoreTestUtils.AGGREGATE;
 import static org.axonframework.eventsourcing.utils.EventStoreTestUtils.createEvent;
 import static org.junit.jupiter.api.Assertions.*;
@@ -112,6 +114,45 @@ class MongoEventStorageEngineTest extends AbstractMongoEventStorageEngineTest {
         List<EventMessage<?>> readEvents = testSubject.readEvents(result, false).collect(toList());
 
         assertEventStreamsById(Arrays.asList(event1, event3, event2), readEvents);
+    }
+
+    @Test
+    void readsEventsWithLegacyStringTimestampsInTimestampOrder() {
+        DomainEventMessage<String> legacy1 = createEvent(0, Instant.parse("2007-12-03T10:15:30.00Z"));
+        DomainEventMessage<String> current1 = createEvent(1, Instant.parse("2007-12-03T10:15:31.00Z"));
+        DomainEventMessage<String> legacy2 = createEvent(2, Instant.parse("2007-12-03T10:15:32.00Z"));
+        DomainEventMessage<String> current2 = createEvent(3, Instant.parse("2007-12-03T10:15:33.00Z"));
+        testSubject.appendEvents(legacy1, current1, legacy2, current2);
+        convertToLegacyTimestamp(legacy1);
+        convertToLegacyTimestamp(legacy2);
+        List<EventMessage<?>> expected = Arrays.asList(legacy1, current1, legacy2, current2);
+
+        assertEventStreamsById(expected, testSubject.readEvents(null, false).collect(toList()));
+        assertEventStreamsById(expected, testSubject.readEvents(testSubject.createTailToken(), false)
+                                                    .collect(toList()));
+
+        TrackingToken beforeFirst = testSubject.createTokenAt(Instant.parse("2007-12-03T10:15:00.00Z"));
+        assertEventStreamsById(expected, testSubject.readEvents(beforeFirst, false).collect(toList()));
+    }
+
+    @Test
+    void tailTokenUsesEarliestEventAcrossTimestampFormats() {
+        Instant earliest = Instant.parse("2007-12-03T10:15:30.00Z");
+        DomainEventMessage<String> current = createEvent(0, earliest);
+        DomainEventMessage<String> legacy = createEvent(1, Instant.parse("2007-12-03T10:15:40.00Z"));
+        testSubject.appendEvents(current, legacy);
+        convertToLegacyTimestamp(legacy);
+
+        MongoTrackingToken tail = (MongoTrackingToken) testSubject.createTailToken();
+
+        assertEquals(earliest, tail.getTimestamp());
+    }
+
+    private void convertToLegacyTimestamp(EventMessage<?> event) {
+        mongoTemplate.eventCollection().updateOne(
+                new Document("eventIdentifier", event.getIdentifier()),
+                new Document("$set", new Document("timestamp", formatInstant(event.getTimestamp())))
+        );
     }
 
     @Test

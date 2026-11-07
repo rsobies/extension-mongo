@@ -39,6 +39,7 @@ import org.axonframework.eventhandling.tokenstore.UnableToClaimTokenException;
 import org.axonframework.eventhandling.tokenstore.UnableToInitializeTokenException;
 import org.axonframework.eventhandling.tokenstore.UnableToRetrieveIdentifierException;
 import org.axonframework.extensions.mongo.MongoTemplate;
+import org.axonframework.extensions.mongo.MongoTimestamps;
 import org.axonframework.serialization.Serializer;
 import org.bson.Document;
 import org.bson.conversions.Bson;
@@ -385,7 +386,7 @@ public class MongoTokenStore implements TokenStore {
                 or(
                         eq(OWNER_PROPERTY_NAME, nodeId),
                         eq(OWNER_PROPERTY_NAME, null),
-                        lt(TIMESTAMP_PROPERTY_NAME, clock.instant().minus(claimTimeout))
+                        claimTimedOutFilter()
                 )
         );
     }
@@ -402,8 +403,23 @@ public class MongoTokenStore implements TokenStore {
                 or(
                         eq(OWNER_PROPERTY_NAME, nodeId),
                         eq(OWNER_PROPERTY_NAME, null),
-                        lt(TIMESTAMP_PROPERTY_NAME, clock.instant().minus(claimTimeout))
+                        claimTimedOutFilter()
                 )
+        );
+    }
+
+    /**
+     * Creates a filter matching token entries whose claim has timed out. Token entries written by earlier versions
+     * store their timestamp as epoch milliseconds instead of a date. Mongo only compares values of the same BSON type,
+     * so both representations are matched explicitly.
+     *
+     * @return a {@link Bson} defining the filter
+     */
+    private Bson claimTimedOutFilter() {
+        Instant timeout = clock.instant().minus(claimTimeout);
+        return or(
+                lt(TIMESTAMP_PROPERTY_NAME, timeout),
+                lt(TIMESTAMP_PROPERTY_NAME, timeout.toEpochMilli())
         );
     }
 
@@ -420,14 +436,10 @@ public class MongoTokenStore implements TokenStore {
     }
 
     private AbstractTokenEntry<?> documentToTokenEntry(Document document) {
-        Object time=document.get(TIMESTAMP_PROPERTY_NAME);
-        if(time instanceof Long){
-            long aa=(long)time;
-        }
         return new GenericTokenEntry<>(
                 readSerializedData(document),
                 document.getString(TOKEN_TYPE_PROPERTY_NAME),
-                document.getDate(TIMESTAMP_PROPERTY_NAME).toInstant().toString(),
+                MongoTimestamps.toInstant(document.get(TIMESTAMP_PROPERTY_NAME)).toString(),
                 document.getString(OWNER_PROPERTY_NAME),
                 document.getString(PROCESSOR_NAME_PROPERTY_NAME),
                 document.getInteger(SEGMENT_PROPERTY_NAME),

@@ -29,19 +29,26 @@ import org.axonframework.eventhandling.DomainEventMessage;
 import org.axonframework.eventhandling.EventMessage;
 import org.axonframework.eventhandling.TrackedEventData;
 import org.axonframework.eventhandling.TrackingToken;
+import org.axonframework.extensions.mongo.MongoTimestamps;
 import org.axonframework.extensions.mongo.eventsourcing.eventstore.documentperevent.EventEntryConfiguration;
 import org.axonframework.serialization.SerializedObject;
 import org.axonframework.serialization.Serializer;
 import org.bson.BsonDocument;
+import org.bson.BsonType;
 import org.bson.BsonString;
 import org.bson.Document;
+import org.bson.conversions.Bson;
 
 import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.Comparator;
 import java.util.Date;
+import java.util.Iterator;
 import java.util.List;
+import java.util.NoSuchElementException;
+import java.util.Objects;
 import java.util.Optional;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.stream.Collectors;
@@ -51,6 +58,7 @@ import static com.mongodb.client.model.Filters.*;
 import static com.mongodb.client.model.Sorts.descending;
 import static com.mongodb.client.model.Sorts.orderBy;
 import static java.util.stream.StreamSupport.stream;
+import static org.axonframework.common.DateTimeUtils.formatInstant;
 import static org.axonframework.common.ObjectUtils.getOrDefault;
 
 /**
@@ -161,26 +169,28 @@ public abstract class AbstractMongoEventStorageStrategy implements StorageStrate
     @Override
     public List<? extends TrackedEventData<?>> findTrackedEvents(MongoCollection<Document> eventCollection,
                                                                  TrackingToken lastToken, int batchSize) {
-        FindIterable<Document> cursor;
+        String timestampProperty = eventConfiguration.timestampProperty();
+        Bson dateFilter;
+        Bson legacyFilter;
         if (lastToken == null) {
-            cursor = eventCollection.find();
+            dateFilter = type(timestampProperty, BsonType.DATE_TIME);
+            legacyFilter = type(timestampProperty, BsonType.STRING);
         } else {
             Assert.isTrue(lastToken instanceof MongoTrackingToken,
                           () -> String.format("Token %s is of the wrong type", lastToken));
             //noinspection ConstantConditions
             MongoTrackingToken trackingToken = (MongoTrackingToken) lastToken;
-            cursor = eventCollection.find(and(gte(eventConfiguration.timestampProperty(),
-                                                  trackingToken.getTimestamp().minus(lookBackTime)),
-                                              nin(eventConfiguration.eventIdentifierProperty(),
-                                                  trackingToken.getKnownEventIds())));
+            Instant lowerBound = trackingToken.getTimestamp().minus(lookBackTime);
+            Bson knownEvents = nin(eventConfiguration.eventIdentifierProperty(), trackingToken.getKnownEventIds());
+            dateFilter = and(gte(timestampProperty, Date.from(lowerBound)), knownEvents);
+            legacyFilter = and(gte(timestampProperty, formatInstant(lowerBound)), knownEvents);
         }
-        cursor = cursor.sort(new BasicDBObject(eventConfiguration().timestampProperty(), ORDER_ASC)
-                                     .append(eventConfiguration().sequenceNumberProperty(), ORDER_ASC));
-        cursor = cursor.batchSize(batchSize);
         //noinspection ConstantConditions
         AtomicReference<MongoTrackingToken> previousToken = new AtomicReference<>((MongoTrackingToken) lastToken);
         List<TrackedEventData<?>> results = new ArrayList<>();
-        try (MongoCursor<Document> iterator = cursor.iterator()) {
+        try (MongoCursor<Document> dateCursor = sortedByTimestamp(eventCollection.find(dateFilter), batchSize);
+             MongoCursor<Document> legacyCursor = sortedByTimestamp(eventCollection.find(legacyFilter), batchSize)) {
+            Iterator<Document> iterator = new TimestampOrderedIterator(dateCursor, legacyCursor);
             while (results.size() < batchSize && iterator.hasNext()) {
                 Document document = iterator.next();
                 extractEvents(document)
@@ -217,14 +227,80 @@ public abstract class AbstractMongoEventStorageStrategy implements StorageStrate
 
     @Override
     public TrackingToken createTailToken(MongoCollection<Document> eventsCollection) {
-        Document first = eventsCollection.find()
-                                         .sort(Sorts.ascending(eventConfiguration.timestampProperty()))
+        return Stream.of(BsonType.DATE_TIME, BsonType.STRING)
+                     .map(bsonType -> firstTimestampOfType(eventsCollection, bsonType))
+                     .filter(Objects::nonNull)
+                     .min(Comparator.naturalOrder())
+                     .map(t -> (TrackingToken) MongoTrackingToken.of(t, Collections.emptyMap()))
+                     .orElse(null);
+    }
+
+    private Instant firstTimestampOfType(MongoCollection<Document> eventsCollection, BsonType bsonType) {
+        String timestampProperty = eventConfiguration.timestampProperty();
+        Document first = eventsCollection.find(type(timestampProperty, bsonType))
+                                         .sort(Sorts.ascending(timestampProperty))
                                          .first();
-        return Optional.ofNullable(first)
-                       .map(d -> d.get(eventConfiguration.timestampProperty()))
-                       .map(t -> ((Date) t).toInstant())
-                       .map(t -> MongoTrackingToken.of(t, Collections.emptyMap()))
-                       .orElse(null);
+        return first == null ? null : MongoTimestamps.toInstant(first.get(timestampProperty));
+    }
+
+    /**
+     * Sorts the given {@code cursor} on timestamp and sequence number and opens it with the given {@code batchSize}.
+     * The sort only yields chronological order for documents whose timestamps share one BSON type, which is why
+     * {@link #findTrackedEvents} queries each type separately.
+     */
+    private MongoCursor<Document> sortedByTimestamp(FindIterable<Document> cursor, int batchSize) {
+        return cursor.sort(new BasicDBObject(eventConfiguration.timestampProperty(), ORDER_ASC)
+                                   .append(eventConfiguration.sequenceNumberProperty(), ORDER_ASC))
+                     .batchSize(batchSize)
+                     .iterator();
+    }
+
+    /**
+     * Merges two cursors that are each sorted on timestamp and sequence number into a single iterator in that same
+     * order. Used to combine documents with BSON date timestamps and documents with legacy ISO-8601 string timestamps,
+     * which Mongo cannot sort against each other.
+     */
+    private class TimestampOrderedIterator implements Iterator<Document> {
+
+        private final Iterator<Document> first;
+        private final Iterator<Document> second;
+        private final Comparator<Document> order =
+                Comparator.comparing((Document d) -> MongoTimestamps.toInstant(
+                                  d.get(eventConfiguration.timestampProperty())))
+                          .thenComparingLong(d -> {
+                              Object sequenceNumber = d.get(eventConfiguration.sequenceNumberProperty());
+                              return sequenceNumber instanceof Number ? ((Number) sequenceNumber).longValue() : 0L;
+                          });
+        private Document nextFirst;
+        private Document nextSecond;
+
+        private TimestampOrderedIterator(Iterator<Document> first, Iterator<Document> second) {
+            this.first = first;
+            this.second = second;
+            this.nextFirst = first.hasNext() ? first.next() : null;
+            this.nextSecond = second.hasNext() ? second.next() : null;
+        }
+
+        @Override
+        public boolean hasNext() {
+            return nextFirst != null || nextSecond != null;
+        }
+
+        @Override
+        public Document next() {
+            if (!hasNext()) {
+                throw new NoSuchElementException();
+            }
+            Document result;
+            if (nextSecond == null || (nextFirst != null && order.compare(nextFirst, nextSecond) <= 0)) {
+                result = nextFirst;
+                nextFirst = first.hasNext() ? first.next() : null;
+            } else {
+                result = nextSecond;
+                nextSecond = second.hasNext() ? second.next() : null;
+            }
+            return result;
+        }
     }
 
     /**

@@ -44,6 +44,7 @@ import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.junit.jupiter.Testcontainers;
 
 import java.time.Duration;
+import java.time.Instant;
 import java.time.temporal.TemporalAmount;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -472,6 +473,38 @@ class MongoTokenStoreTest {
         assertTrue(result.isPresent());
         String resultStorageIdentifier = result.get();
         assertEquals(expectedStorageIdentifier, resultStorageIdentifier);
+    }
+
+    @Test
+    void timedOutClaimWithLegacyEpochMillisTimestampCanBeStolen() {
+        String processorName = "legacyProcessor";
+        tokenStoreDifferentOwner.initializeTokenSegments(processorName, 1);
+        tokenStoreDifferentOwner.fetchToken(processorName, 0);
+        setLegacyTimestamp(processorName, 0, Instant.now().minus(Duration.ofMinutes(1)));
+
+        assertEquals(1, tokenStore.fetchAvailableSegments(processorName).size());
+        assertDoesNotThrow(() -> tokenStore.fetchToken(processorName, 0));
+        assertEquals(testOwner, trackingTokensCollection.find(eq("processorName", processorName))
+                                                        .first()
+                                                        .getString("owner"));
+    }
+
+    @Test
+    void activeClaimWithLegacyEpochMillisTimestampCannotBeStolen() {
+        String processorName = "legacyProcessor";
+        tokenStoreDifferentOwner.initializeTokenSegments(processorName, 1);
+        tokenStoreDifferentOwner.fetchToken(processorName, 0);
+        setLegacyTimestamp(processorName, 0, Instant.now());
+
+        assertTrue(tokenStore.fetchAvailableSegments(processorName).isEmpty());
+        assertThrows(UnableToClaimTokenException.class, () -> tokenStore.fetchToken(processorName, 0));
+    }
+
+    private void setLegacyTimestamp(String processorName, int segment, Instant timestamp) {
+        trackingTokensCollection.updateOne(
+                and(eq("processorName", processorName), eq("segment", segment)),
+                new Document("$set", new Document("timestamp", timestamp.toEpochMilli()))
+        );
     }
 
     @Test
